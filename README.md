@@ -1,81 +1,69 @@
 # Odyssey
 
-Odyssey is an offline audio guide for ancient places. A visitor downloads one curated walking route, then walks it with the phone in a pocket or in one hand. Each stop has a single human narration. Numbered markers on the main photograph open a silent museum label: a picture, a short text, and an evidence tag that says how strong the claim is.
+Odyssey is an offline audio guide for ancient places. A visitor downloads one curated walk, then uses it with the radio off. The phone holds the pack. AWS builds the pack, stores it, signs it, and hands it out.
 
-The same stops are the teaching unit later. A guide, a teacher, or a student can return to a monument without a network connection and without a second, different product.
+The production system is AWS, in `eu-central-1`, defined as AWS CDK stacks. There is no second cloud and no server left running between publishes. A publish is an AWS Step Functions execution. A download is Amazon CloudFront. A walk does not call AWS.
 
-This repository is the public product record: the design system and the system architecture. It does not contain narration scripts, photography, audio masters, or credentials.
-
-Odyssey is a separate product from [trkutuphane.com](https://www.trkutuphane.com). The site is a library for working tourist guides. Odyssey is the field guide those places deserve.
-
-## The problem
-
-At an archaeological site the network is a courtesy, not a guarantee. Shade is scarce, the screen is in sun, and one hand is often holding a bag, a child, or the phone itself. Most audio guides still assume a live connection, a menu of features, and a visitor who will stand still and operate an app.
-
-The interpretation problem is older than the network problem. A façade carries rebuilt stone, later restoration, and a guide's paraphrase in the same glance. Visitors cannot see which sentence is inscription, which is a reasonable reconstruction, and which is commentary. Odyssey treats that distinction as part of the interface, not as a footnote.
+Odyssey is a separate product from [trkutuphane.com](https://www.trkutuphane.com). This repository is the product record: the design system and the AWS architecture. It does not contain narration, photography, or credentials.
 
 ## What a visit is
 
-1. **Keşfet.** A short catalog of real places. The first release opens on this catalog. There is no province picker and no search until the catalog is large enough to need them.
-2. **Acquire.** The visitor downloads one destination pack. The pack is the route, the narrations, the photographs, and the labels.
-3. **Çantam.** Downloaded packs live here, with their storage cost visible. This is the second and last tab.
-4. **Saha.** Field mode is full screen. The tab bar is gone. The visitor moves stop to stop. Nothing starts playing by itself.
-5. **Durak.** One narration. One hero photograph. A few numbered markers. Tapping a marker opens a label. The narration keeps playing.
+1. **Keşfet.** The catalog comes from Amazon API Gateway. The first release opens here. No province picker, no search, until the catalog is large enough to need them.
+2. **Acquire.** The visitor asks for a pack. API Gateway checks Amazon DynamoDB, then returns a short-lived CloudFront URL. The bytes are an immutable object in Amazon S3.
+3. **Çantam.** Downloaded packs and the space they use. This is the second and last tab.
+4. **Saha.** Field mode is full screen. The tab bar is gone. Nothing starts playing by itself. This screen does not call AWS.
+5. **Durak.** One narration. One hero photograph. A few numbered markers. A marker opens a silent label. The narration keeps playing.
 6. **Leave.** Closing field mode returns to the pack. Playback position stays on the device.
 
-A destination is one curated walk. The visitor does not draw a route, and the map does not invent one. The polyline and the pins ship inside the pack.
+A destination is one curated walk. The visitor does not draw a route. The polyline ships inside the pack.
 
-## Product rules that do not move
+## Product rules
 
-These are summarized here and specified in [tasarim_kurallari.md](tasarim_kurallari.md).
+Specified in [tasarim_kurallari.md](tasarim_kurallari.md).
 
-- Two tabs only: Keşfet and Çantam. Account is an avatar push, not a tab.
-- One narration per stop. Markers do not have their own audio.
-- Evidence is labeled Kanıtlı, Olası, or Yorum. The tag matches the weakest claim in the label, and a Dayanak line says why.
-- No autoplay. Standing near a stop is not consent to hear it.
-- Field mode stays light. Brand terracotta and the field action color are different colors, for contrast in sunlight.
+- Two tabs: Keşfet and Çantam. Account is an avatar push, backed by Amazon Cognito when an account exists.
+- One narration per stop. Markers have no audio of their own.
+- Evidence is labeled Kanıtlı, Olası, or Yorum. The tag matches the weakest claim. A Dayanak line says why.
+- No autoplay.
+- Field mode stays light. Brand terracotta is `#E05D34`. Field actions are `#C2410C`, because small text on white must clear contrast in sun.
 - The interface follows Apple's Human Interface Guidelines. The interface language is Turkish.
 
-Out of scope, on purpose: augmented reality, a generated 3D city, a third or fourth tab, a map the visitor edits, and a separate podcast for each photograph.
+Out of scope: augmented reality, a generated 3D city, a third tab, a route the visitor draws, and a separate audio file per photograph.
 
-## Design language
+## AWS, by job
 
-The accent is terracotta, `#E05D34`, used as identity: primary actions in the calm catalog, the active tab, large marks. It does not pass for small text on white. Field actions use `#C2410C`, which does. Surfaces are white and the system gray `#F2F2F7`. One accent family, light theme only, until a dark field theme can be tested outdoors rather than on a desk.
-
-The full token set, type ramp, touch sizes, navigation, mini player, marker behavior, and field-mode rules are in [tasarim_kurallari.md](tasarim_kurallari.md).
-
-## Architecture
-
-The client is offline after the pack is on the device. The cloud exists to store masters, build an immutable pack, and hand the visitor a download that can finish before they lose signal.
-
-The target stack is small:
-
-| Concern | Service |
+| Job | Service |
 | --- | --- |
-| Private masters and versioned packs | Amazon S3 |
-| Download distribution | Amazon CloudFront |
-| Speech transcode | AWS Elemental MediaConvert |
-| Pack assembly and catalog API | AWS Lambda, Amazon API Gateway |
-| Catalog, pack versions, entitlements | Amazon DynamoDB |
-| Accounts, when accounts exist | Amazon Cognito |
-| Pipeline and download health | Amazon CloudWatch |
+| Masters, derivatives, versioned packs | Amazon S3 |
+| Download to the phone | Amazon CloudFront, signed URLs, AWS WAF |
+| Speech, wav to AAC | AWS Elemental MediaConvert |
+| Publish orchestration | AWS Step Functions, Amazon EventBridge, AWS Lambda |
+| Catalog, entitlements, signing | Amazon API Gateway, AWS Lambda, Amazon DynamoDB |
+| Accounts | Amazon Cognito |
+| Encryption and the signing key | AWS KMS, AWS Secrets Manager, IAM |
+| TLS for the distribution | AWS Certificate Manager |
+| Editor alert when a publish fails | Amazon SNS |
+| Operations | Amazon CloudWatch, AWS X-Ray |
+| The stacks | AWS CDK |
 
-Frankfurt (`eu-central-1`) is the home region. CloudFront is the edge. The reasoning, the pack format, the failure behavior, and the build phases are in [ARCHITECTURE.md](ARCHITECTURE.md).
+The reasoning, the table keys, the state machine, and the failure behavior are in [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## What the phone does without AWS
+
+After the checksum matches, field mode makes no network call to play, to open a label, or to draw the route. AWS is the system of record up to that checksum. It is not in the path of the narration.
 
 ## Status
 
-November 2026. The design system and the architecture are in force. The client and the pack pipeline are the build in front of us. This repository will gain code as those land. It will not gain placeholder screenshots presented as a finished app.
-
-What "done" means for the first destination: a pack downloads, verifies, and opens in field mode with the radio off.
+November 2026. The design system and the AWS architecture are the build. The first milestone is those stacks in `eu-central-1`, one destination, a pack that verifies, and a walk with the radio off. This repository will gain the client, the CDK stacks, and the Lambda handlers as they land. It will not gain placeholder screenshots presented as a finished app, and it will not gain a second backend "for now."
 
 ## What is not in this repository
 
-- Narration manuscripts and interview recordings
+- Narration manuscripts and recordings
 - Photography and audio masters
 - Visitor data
 - Signing keys, cloud credentials, or payment configuration
 
-Public documents describe behavior and structure. They do not publish the text of a monument label before an archaeologist has signed it.
+Public documents describe behavior and structure. They do not publish a monument label before the person responsible for that destination has accepted the evidence tag.
 
 ## Contact
 
