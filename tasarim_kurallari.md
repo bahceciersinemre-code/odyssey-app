@@ -250,3 +250,22 @@ Yeni bir ekran açmadan önce üç soru sorulur:
 3. Bu ekrandaki en küçük turuncu iz, güneşte 4,5:1 tutuyor mu? Tutmuyorsa renk `color.brand` değil `color.field` olur.
 
 Üçüne de cevap veremeyen ekran çizilmez.
+
+
+## 16. Sunucu AWS üzerindedir
+
+Telefon, paketi indirdikten sonra AWS'e sormaz. Paketten önceki her iş AWS'tedir. Ayrıntı [ARCHITECTURE.md](ARCHITECTURE.md) içindedir. Burada yalnızca arayüzün dayandığı sözleşme var.
+
+| İş | AWS |
+| --- | --- |
+| Ana kayıt, türetilmiş ses ve sürümlü paket | Amazon S3 |
+| İndirme | Amazon CloudFront, imzalı adres, AWS WAF |
+| Konuşmayı AAC'ye çevirme | AWS Elemental MediaConvert |
+| Yayınlama | AWS Step Functions, Amazon EventBridge, AWS Lambda |
+| Katalog ve indirme hakkı | Amazon API Gateway, AWS Lambda, Amazon DynamoDB |
+| Hesap | Amazon Cognito |
+| Anahtar ve şifreleme | AWS KMS, AWS Secrets Manager, IAM |
+| İzleme | Amazon CloudWatch, AWS X-Ray |
+| Yığınların kendisi | AWS CDK |
+
+Bölge `eu-central-1`. İkinci bir bulut yok. Sürekli açık bir sunucu yok. Saha modu bu tablodaki hiçbir servisi çağırmaz.
