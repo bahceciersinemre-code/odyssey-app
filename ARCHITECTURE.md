@@ -1,54 +1,91 @@
-# Odyssey architecture
+# Odyssey on AWS
 
-November 2026. This is the target architecture for the first destination, not a claim that every service is already provisioned. The client and the pack pipeline are the build. The shapes below are what they are being built toward.
+November 2026. This is the production architecture. The field client plays a pack that AWS has built and signed. Until the first publish succeeds, no visitor URL is issued. The stacks below are what gets stood up, not a menu of optional vendors.
 
-The design system that the client has to obey is [tasarim_kurallari.md](tasarim_kurallari.md). This document does not repeat the color table. It describes how a pack is made, stored, delivered, and played when the radio is off.
+Home region is `eu-central-1`. One account. Infrastructure is AWS CDK. A change to the system is a change to a stack, not a server someone SSH-es into.
 
-## 1. What the system has to guarantee
+The design system is [tasarim_kurallari.md](tasarim_kurallari.md). This document does not repeat the color table.
 
-1. After a pack is marked ready, field mode makes no network call in order to play, to open a label, or to draw the route.
-2. A pack is immutable. A correction is a new version, not an overwrite of the bytes a visitor already verified.
-3. The catalog may be stale. The pack on disk may not. Playback never waits for the catalog.
-4. Masters never sit in a public bucket. The thing CloudFront serves is a built pack, or a short preview, behind a decision we can revoke.
-5. A failed checksum never becomes a ready pack.
+## 1. The split
 
-These five rules are the filter for every later service. A component that needs a socket open during a stop does not belong in field mode.
+AWS owns every byte until the phone has verified the pack.
 
-## 2. Context
+| On AWS | On the phone, after the checksum |
+| --- | --- |
+| Masters, transcodes, resized photographs | The verified pack directory |
+| The catalog and the current-version pointer | Ready flag, download progress, playback position |
+| Accounts and entitlements | Nothing that identifies another visitor |
+| Signed download URLs | The walk itself |
 
-```mermaid
-flowchart LR
-  edit[Editorial masters] --> s3m[S3 private masters]
-  s3m --> mc[MediaConvert]
-  mc --> build[Lambda pack builder]
-  build --> s3p[S3 versioned packs]
-  s3p --> cf[CloudFront]
-  cf --> device[On-device pack store]
-  api[API Gateway and Lambda] --> ddb[DynamoDB]
-  device --> api
-  device --> field[Field mode]
-```
+Field mode, the stop screen, and the label sheet do not call AWS. If the process is killed, the client returns to the last stop with the narration paused. It does not resume audibly by itself, and it does not ask the catalog whether it may continue.
 
-Two stores, on purpose. The private bucket holds wav masters, original photographs, and the editorial source of a label. The pack bucket holds the object the phone is allowed to see: compressed audio, resized photographs, a manifest, and label documents. The phone never receives the private bucket's name.
+## 2. Stacks
 
-## 3. The pack
+Four CDK stacks, in one account. They share a KMS key and almost nothing else.
 
-A destination pack is one curated walk. It is a versioned object, addressed as `packs/{destinationId}/{version}/`. The version is an integer that only increases.
+| Stack | Creates |
+| --- | --- |
+| `Identity` | Amazon Cognito user pool and app client |
+| `Data` | Amazon DynamoDB tables, the customer-managed KMS key |
+| `Media` | Private masters bucket, MediaConvert role, AWS Step Functions, builder Lambdas, Amazon SNS topic for a failed publish |
+| `Delivery` | Pack bucket, Amazon CloudFront with origin access control, AWS WAF, AWS Certificate Manager certificate, Amazon API Gateway HTTP API, catalog Lambdas, the CloudFront signing key in AWS Secrets Manager |
 
-### 3.1 Layout
+`Delivery` reads the current-version pointer. It cannot write a pack. `Media` can write the next version prefix. It cannot move the pointer until the checksum row exists. That split is IAM, not a convention.
+
+## 3. Services
+
+| Service | Role | Why this one |
+| --- | --- | --- |
+| Amazon S3 | Three buckets: masters, packs, previews. Block public access. Versioning on the masters bucket. | The source of a correction has to outlive the correction. The phone never learns the masters bucket's name. |
+| Amazon CloudFront | The only public front for bytes. Origin access control. HTTP range. Signed URLs. HTTPS only. | Visitors download the night before a trip, far from Frankfurt. The field does not hit an origin. |
+| AWS WAF | On the distribution and on the API. Rate-limit the signing route. | A leaked client should not be able to mint URLs in a loop. |
+| AWS Elemental MediaConvert | Wav master to AAC in an m4a container, one loudness target for every stop. | Level jumps between stops are a field bug. Transcode is a job, not a warm server. |
+| AWS Step Functions | One Standard workflow, `PublishPack`. | A transcode can run longer than an Express execution. Standard is the one that can wait for MediaConvert. |
+| Amazon EventBridge | Starts a publish from the API, and routes a failed execution to the alarm. | The editor's button and the operator's alarm are events, not a poll. |
+| AWS Lambda | Validate, image derivatives, assemble the manifest, sign a download, catalog reads. | These run when something happens. None of them run while someone is standing at a façade. |
+| Amazon API Gateway | HTTP API. Catalog, signed download, entitlement webhook, start-publish. | One front door and one authorization story. |
+| Amazon DynamoDB | Destinations, pack heads, entitlements, builds. On-demand. Point-in-time recovery. | A few rows per destination, read on each catalog call, written when we publish. Not a session store for the field. |
+| Amazon Cognito | The account, when an account exists. The app uses the identity SDK. | We do not operate a password database. |
+| AWS KMS | One customer-managed key for the buckets, the tables, and Secrets Manager. | SSE-S3 is not enough once a signing key and entitlements share the account. |
+| AWS Secrets Manager | The CloudFront private key, and the webhook secret from the payment provider. | Lambda reads them at runtime. They are not in the pack and not in this repository. |
+| AWS Certificate Manager | The certificate on the distribution. | HTTPS only, issued and renewed in AWS. |
+| Amazon SNS | One topic. A failed `PublishPack` execution notifies the editor. | The visitor never sees this topic. |
+| Amazon CloudWatch | Logs, metrics, alarms. | A pack that cannot be built has to reach a person. |
+| AWS X-Ray | Traces on the HTTP API and on the state machine. | A slow sign-url call should be a trace, not a guess. |
+| IAM | Three roles: editor, builder, catalog. No shared long-lived key that can publish. | The pointer move is a permission, not a code comment. |
+| AWS CDK | The four stacks. | The architecture in this file is what the stacks implement. |
+
+Not in the account, on purpose: Amazon EKS, Amazon ECS, Amazon OpenSearch, AWS IoT, Amazon Location Service, a second region "for the diagram," and any service whose job is to watch a visitor's position. Download bytes and MediaConvert minutes are the cost. The catalog's request volume is noise next to those two.
+
+The payment provider is the one system outside AWS. It confirms a charge to API Gateway. From that request on, the grant is a DynamoDB row. The provider is not named in this repository, and its keys live in Secrets Manager.
+
+## 4. S3
 
 ```text
-manifest.json
-audio/stop-04.m4a
-images/stop-04-hero.jpg
-images/stop-04-marker-1.jpg
-labels/stop-04-marker-1.json
-route.geojson
+s3://odyssey-masters/         private, no CloudFront
+  {destinationId}/{stopId}/master.wav
+  {destinationId}/{stopId}/source/{photo}
+
+s3://odyssey-packs/           private, CloudFront origin access control
+  {destinationId}/{version}/manifest.json
+  {destinationId}/{version}/audio/{stopId}.m4a
+  {destinationId}/{version}/images/...
+  {destinationId}/{version}/labels/...
+  {destinationId}/{version}/route.geojson
+
+s3://odyssey-previews/        private, same distribution, separate path
+  {destinationId}/{version}/preview.m4a
 ```
 
-`manifest.json` is the only file the client has to understand in order to decide that the pack is complete. Everything else is named by the manifest. A file that is not in the manifest is not part of the walk, even if it was uploaded beside it.
+Bucket names in the account will carry the account's prefix. The shape is this. Public access blocks are on. There is no S3 website endpoint.
 
-### 3.2 Manifest, structural example
+Masters use versioning. Packs are immutable prefixes: a new integer, a new prefix, never an overwrite of a version a phone might already be checking. Lifecycle rules do one thing: abort incomplete multipart uploads. They do not expire old pack versions. Expiring version 3 would strand a phone that recorded version 3.
+
+Pack objects are Standard. They are downloaded soon, often once, in full. Masters stay Standard as well until a destination is retired. Glacier would make a correction wait on a restore, which is the wrong trade for a short catalog of walks.
+
+## 5. The pack
+
+`manifest.json` is the only file the client needs in order to know the pack is complete. Anything not named there is not part of the walk.
 
 The identifiers below are illustrative. They are not a published destination.
 
@@ -81,219 +118,152 @@ The identifiers below are illustrative. They are not a published destination.
 }
 ```
 
-`x` and `y` are fractions of the hero image, origin at the top left. The client converts them to the view it actually has. Pixel coordinates do not ship, because the photograph has more than one derivative.
+`x` and `y` are fractions of the hero image. `cue` is a half-open range, in seconds, of that stop's single narration. Ranges on one stop do not overlap. `title` is the route position («Durak 4»). `n` is the number painted on the photograph. They are different series, in different fields.
 
-`cue` is a half-open range in seconds of that stop's single narration. While playback time is inside the range, the matching marker is the active one. Ranges on one stop do not overlap. A marker without a cue is legal: it can be opened by touch and the narration does not point at it. The reverse is not the product. We do not point at a photograph we refuse to open.
+A label document is JSON: `title`, `body`, `evidence` (`supported`, `possible`, or `interpretation`), `basis`, `sources`. The Turkish interface renders those as Kanıtlı, Olası, and Yorum. The label has no audio file. A client that finds one ignores it.
 
-`title` on the stop is the route position, in words the interface already uses («Durak 4»). The integers painted on the photograph are `n`. They are a different series. The manifest keeps them in different fields so a client cannot accidentally draw one as the other.
+`route.geojson` is one LineString and one Point per stop, in walk order. It is the curated path. The first release does not record GPS. "Nearby" is a status line when the device already has a fix. It is not a trigger, and it is not an Amazon Location Service call.
 
-### 3.3 Label document
+Speech is AAC, loudness-normalized in MediaConvert, so stops sit at one level. Photographs are resized for a phone. Camera originals and wav masters stay in the masters bucket and are not in the download.
 
-```json
-{
-  "title": "Short object title",
-  "body": "Museum-label length. No script of the narration.",
-  "evidence": "supported",
-  "basis": "One sentence on why the tag is what it is.",
-  "sources": ["Short citation, not a file from the private bucket"]
-}
-```
+## 6. PublishPack
 
-`evidence` is one of `supported`, `possible`, `interpretation`. The Turkish interface renders those as Kanıtlı, Olası, and Yorum. The tag is the weakest claim in `body`. `basis` is the Dayanak line. `sources` is the bibliography, long enough to find the publication, short enough for a phone.
-
-The label does not contain a second audio file. A client that finds one ignores it.
-
-### 3.4 Route file
-
-GeoJSON, one LineString, one Point per stop, in walk order. Coordinates are the curated path, not a live trace from a visitor's phone. The first release does not record GPS. "Nearby" is allowed only when the device already has a fix and the visitor has the pack. It is a status line. It is not a trigger.
-
-### 3.5 Size
-
-Narration is speech, encoded as AAC in an m4a container, loudness-normalized so stops sit at one level. Photographs are resized for a phone screen, not shipped as camera originals. A walk is a few dozen minutes of speech plus a handful of photographs per stop. The budget is practical: the pack finishes on ordinary broadband before the visit, including from a hotel the night before. Camera originals and wav masters stay in the private bucket and are not in this sum.
-
-## 4. Client
-
-The field client is a React Native application, built with Expo, for iOS and Android. The design system is mobile-first. A desktop site is not the field product.
-
-On the device:
-
-| Store | Holds | Does not hold |
-| --- | --- | --- |
-| Pack directory | The verified version of one or more destinations | Masters, other visitors, payment instruments |
-| Small local record | Ready flag, download progress, playback position, which version is on disk | A second copy of the label text |
-
-Playback position is local in the first release. Remembering a position across phones is an account feature, later, and it never blocks playback on the phone that already has the file.
-
-### 4.1 States
+`POST /destinations/{id}/publishes` on API Gateway starts one Standard execution. The editor is authenticated. The Lambda that starts the execution does not copy media itself.
 
 ```mermaid
 stateDiagram-v2
-  [*] --> Catalog
-  Catalog --> Downloading: visitor asks
-  Downloading --> Downloading: connection drops, then returns
-  Downloading --> Failed: checksum mismatch
-  Failed --> Downloading: retry
-  Downloading --> Ready: checksum matches
-  Ready --> Field: visitor opens the field
-  Field --> Stop: visitor chooses a stop
-  Stop --> Label: visitor taps a marker
-  Label --> Stop: visitor closes the label
-  Field --> Ready: visitor closes the field
+  [*] --> Validate
+  Validate --> Transcode: labels and cues are complete
+  Validate --> Failed: a label is missing its evidence tag
+  Transcode --> Derivatives: MediaConvert jobs succeeded
+  Transcode --> Failed: a job failed
+  Derivatives --> Assemble
+  Assemble --> Commit: checksum row written
+  Commit --> [*]
+  Failed --> [*]
 ```
 
-`Ready` is the only door into `Field`. `Downloading` and `Failed` are visible in Çantam. Leaving the download screen does not cancel the download. Cancelling is an explicit control.
+1. **Validate.** Lambda checks that every stop has one audio master, a hero, and labels whose `evidence` and `basis` are present. It cannot check that they are true. A person accepts the historical claim before this call. The state machine does not skip that.
+2. **Transcode.** The Step Functions service integration runs MediaConvert and waits. Outputs land in a build prefix of the pack bucket, not in the version prefix yet.
+3. **Derivatives.** Lambda writes resized images beside the m4a files.
+4. **Assemble.** Lambda writes `manifest.json`, the per-file sha256 table, and the route. It writes a DynamoDB build row that is not current.
+5. **Commit.** A conditional update moves `currentVersion` to the new integer. Two publishes serialize on that row.
+6. **Failed.** EventBridge sees the execution failure. SNS notifies the editor. `currentVersion` does not move.
 
-Nothing in `Field`, `Stop`, or `Label` calls the catalog. If the process was killed, the client returns to the last stop with the narration paused at the stored position. It does not resume audibly by itself.
+CloudFront does not need an invalidation of the media. The path contains the version. The catalog response is the only cache that ages, and its TTL is short.
 
-### 4.2 Missing pieces
+A visitor mid-download of version 3 keeps downloading version 3 when version 4 becomes current. The next acquisition sees 4. The ready pack stays 3 until the visitor replaces it.
 
-A missing photograph is a flat surface and the label title. A missing audio file disables Dinle and leaves the labels usable. A missing manifest, or a checksum mismatch, is not a partial walk. The version is deleted or kept only as an incomplete download, and it is not marked ready.
+## 7. Catalog and download
 
-## 5. Online services
+`GET /destinations` returns what Keşfet renders: identity, title, region, approximate duration, latest version, byte size, and whether a preview exists. It does not return label bodies. Those live in the pack.
 
-The online side is a catalog and a file delivery system. It is not in the path of the narration.
+`GET /destinations/{id}/download` returns a descriptor: version, byte size, sha256, and a CloudFront URL that expires in minutes. The catalog Lambda signs it with the key in Secrets Manager. The URL is refused without an entitlement row, or without the destination's free flag.
 
-### 5.1 Catalog
+CloudFront serves the versioned prefix with HTTP range, so a dropped hotel network continues. Revoking future downloads is "stop signing." It does not reach into a phone that already verified the file. Removing a pack from a device is a local delete.
 
-`GET /destinations` returns the list Keşfet renders: identity, title, region, approximate duration, latest pack version, pack byte size, and whether a preview exists. It does not return label bodies. Label bodies live in the pack.
+A preview, when one exists, is its own object and its own short manifest under `odyssey-previews`. It does not contain the full label set, it does not start by itself, and it does not unlock field mode.
 
-`GET /destinations/{id}` returns the same record plus the download descriptor: object key, version, byte size, sha256, and a URL that expires.
+## 8. DynamoDB
 
-The catalog is cacheable. The client may show the last successful response when the network is gone, with the time of that response in a secondary line. It may not treat that cache as permission to invent a pack that was never downloaded.
+On-demand capacity. Encryption with the customer-managed key. Point-in-time recovery on.
 
-### 5.2 Download
-
-CloudFront serves the versioned prefix. Requests use HTTP range, so a dropped hotel network continues rather than starting over. The URL is signed and short-lived. The bytes are not secret in the literary sense — a guide is meant to be heard — but they are not an open bucket. A signed URL lets us stop issuing new downloads without breaking a pack that is already verified on a device. Revocation of an already downloaded pack is a local delete, not a remote kill switch. We do not build a mechanism that reaches into a phone in airplane mode.
-
-### 5.3 Entitlement
-
-The first destinations can be acquired without an account. When a destination is paid, the sequence is:
-
-1. A payment provider confirms the charge to our API. The provider is not named here and its keys are not in this repository.
-2. The API writes an entitlement: this account, this destination, this pack version or "current".
-3. The catalog refuses a signed URL without that row, or without an anonymous free flag on the destination.
-4. The device downloads, verifies, and from then on does not ask again in order to play.
-
-Restoring purchases is "list my entitlements and download the versions I am missing." It is not a stream.
-
-### 5.4 Accounts
-
-Account is an avatar page, not a tab, because the walk does not need one. Amazon Cognito is the intended home for the account when it exists. The first field release does not block on it. We will not invent a parallel user table "for now" and migrate later.
-
-### 5.5 Preview
-
-A preview, if the destination has one, is a short audio object with its own signed URL and its own small manifest. It does not contain the full label set. Preview playback uses the same player and the same rule: it does not start by itself, and it does not unlock field mode.
-
-## 6. AWS, service by service
-
-Home region is `eu-central-1`. Visitors are often elsewhere when they download, the night before a trip. The edge is CloudFront. We do not run the application in two regions to look distributed. A second region is a copy of the pack bucket, later, if a single region fails a download window often enough to measure. It is not part of the first build.
-
-| Service | Role | Why this, and not a larger design |
+| Table | Key | Holds |
 | --- | --- | --- |
-| Amazon S3, masters | Wav, camera originals, editorial source. Block public access. Versioning on. | The source of a correction has to survive the correction. |
-| Amazon S3, packs | Immutable version prefixes. Lifecycle only on aborted multipart uploads. | A lifecycle rule that expires old pack versions would strand a phone that already recorded that version number. Old versions stay until we deliberately retire them. |
-| Amazon CloudFront | Pack and preview distribution, HTTP range, signed URLs, HTTPS only. | Downloads happen far from Frankfurt, once, in a hurry. The field itself should not be hitting an origin. |
-| AWS Elemental MediaConvert | Wav master to AAC m4a, one loudness target for every stop. | Speech that changes level from stop to stop is a field bug, not a preference. Transcode is a job, not a server we keep warm. |
-| AWS Lambda | Pack builder. Image derivatives. Catalog handlers. Signing the download. | The builder runs when an editor publishes a version. It does not run while someone is standing at a façade. |
-| Amazon API Gateway | The catalog and the entitlement webhook. | One front door, the same authorization story for every route. |
-| Amazon DynamoDB | Destination records, current version pointer, entitlements, build status. On-demand capacity. | The catalog is a few rows per destination, read often, written when we publish. It is not a session store for field mode. |
-| Amazon Cognito | Accounts, later. | We do not operate a password database. |
-| Amazon CloudWatch | Build failures, transcode failures, 4xx and 5xx on the catalog, origin errors. | A pack that cannot be built has to page a person. A stop that played offline will not appear here, and that absence is correct. |
-| Amazon EventBridge | "Transcode finished" starts the builder. "Builder finished" moves the current-version pointer. | The pointer moves last, after the checksum is written. Clients never see a version whose bytes are half there. |
+| `destinations` | `destinationId` | Title, region, locale, approximate duration, free flag |
+| `pack_heads` | `destinationId` | `currentVersion`, checksum, byte size, updated at |
+| `builds` | `destinationId` + `version` | Status, per-file checksums, execution ARN. Not readable by the catalog role until status is committed. |
+| `entitlements` | `accountId` + `destinationId` | The grant: this account, this destination, "current" or a pinned version |
 
-Services we are not adopting in order to fill a diagram: a Kubernetes cluster, a search engine, a data warehouse, a realtime multiplayer layer, AWS IoT, and any service whose job would be to track a visitor's position in the field. Download volume and transcode minutes are the actual cost. The credits are for that, plus the ordinary API traffic of a catalog.
+The catalog role can read `destinations`, `pack_heads`, and `entitlements`. It cannot read `builds` in a non-committed status, and it cannot write a pack. The builder role can write `builds` and, only in the Commit state, update `pack_heads` with a condition that the version is exactly one greater than current.
 
-### 6.1 Identity and access
+## 9. Identity
 
-Three roles, no shared long-lived keys on a laptop beyond a personal developer profile that cannot publish.
+Account is an avatar page, not a tab, because the walk does not need one. When it exists, it is a Cognito user pool. The React Native client (Expo) uses the Cognito identity SDK. There is no parallel user table to migrate later.
+
+The first destinations can be acquired without an account, by the free flag. A paid destination waits for the provider's confirmation, then the entitlement row. Restoring on a second device is "list my entitlements and download what this phone does not have." It is not a stream, and it is not required to press play on a pack that is already verified.
+
+Cognito sends its own mail for sign-up and password reset at the start. Amazon SES is added only if that volume outgrows Cognito's mail. It is not a second product path.
+
+## 10. IAM
 
 | Role | Can | Cannot |
 | --- | --- | --- |
-| Editor | Put masters into the private bucket. Start a publish. | Change the current-version pointer by hand. Read the pack bucket's signing key. |
-| Builder | Read masters, write the next version prefix, write the checksum row. | Move the current-version pointer before the checksum exists. Delete an older version. |
-| Catalog | Read destination and entitlement rows. Sign a download for a version that is current or already entitled. | Read the masters bucket. Write a pack. |
+| Editor | Put masters. Call `POST .../publishes`. | Move `currentVersion` by hand. Read the CloudFront signing key. |
+| Builder | Read masters. Write the next pack prefix. Write the build row. Update `pack_heads` only with the version condition. | Delete an older version. Sign a visitor URL. |
+| Catalog | Read destinations, heads, entitlements. Sign a URL for a current or entitled version. | Read the masters bucket. Write a pack. Read Secrets Manager beyond the signing key. |
 
-The current-version pointer is a single conditional write after the builder has stored the manifest checksum. Two publishes in a row serialize on that row. A visitor who is mid-download of version 3 keeps downloading version 3 when version 4 becomes current. Their next acquisition sees 4. Their ready pack stays 3 until they choose to replace it.
+No laptop holds a key that can do all three. A developer profile can synthesize and read logs. It cannot publish.
 
-### 6.2 Buckets and encryption
+## 11. Encryption and TLS
 
-Both buckets use SSE-S3 or a customer-managed key in KMS. The choice is made at provisioning and then left alone. Public access blocks are on. The pack bucket's objects are reachable through CloudFront, not through an open S3 website endpoint. The masters bucket has no CloudFront distribution in front of it at all.
+One KMS key, rotation on, used by the three buckets, the four tables, and Secrets Manager. The CloudFront public key sits in a trusted key group. The private key is a secret, read by the catalog Lambda, never written into an environment variable in the repository.
 
-Object keys are not a secret, and they are not an access policy. Access is the bucket policy plus the signature.
+ACM terminates TLS on the distribution. The API is HTTPS only. The masters bucket has no distribution in front of it.
 
-## 7. Publish pipeline
+Object keys are not an access policy. Access is the bucket policy, origin access control, and the signature.
 
-1. An editor uploads a wav and the photographs for a stop, and commits the label documents to the editorial source.
-2. Publish is requested for a destination at a new version integer.
-3. MediaConvert produces the m4a files into a build prefix.
-4. The builder writes resized images, copies labels and the route, and writes `manifest.json` with a checksum over the manifest payload and a table of per-file sha256.
-5. The builder writes those digests to DynamoDB in a build row that is not yet current.
-6. A conditional update moves `currentVersion` to the new integer.
-7. CloudFront does not need an invalidation of the media. The path contains the version. The catalog response is the only cache we have to age, and its TTL is short.
+## 12. The client, where it touches AWS
 
-A failure at 3, 4, or 5 leaves `currentVersion` where it was. The half-written prefix can be deleted by the builder or left for inspection. It is not linked from the catalog, so a client cannot download it.
+The field client is React Native, Expo, iOS and Android. It touches AWS in three places, all before or beside the walk:
 
-## 8. Security and privacy
+1. Cognito, if the visitor signs in.
+2. API Gateway, for the catalog and for a signed URL.
+3. CloudFront, for the bytes. Range requests. Then the checksum. Then Ready.
 
-- No credentials, signing keys, or provider secrets in this repository. None in the pack.
-- The pack contains no account identifier and no payment record.
-- Field mode does not upload a GPS trace. The first release does not record one.
-- Catalog logs may keep an IP long enough to operate and to defend the signing endpoint, then they go. They are not a product dataset.
-- Crash reporting, if added, carries an install identifier we generate, not a name, and not the text of a label.
-- Signed URLs expire in minutes, not days. A leaked URL is a short window, not a permanent mirror.
-- Editors sign in as themselves. There is no shared "upload" user.
+Playback position is local in the first release. Remembering it on another phone is a later write to DynamoDB, and it never blocks play on the phone that has the file.
 
-The editorial content has its own gate, which is not an AWS feature: a label that states a historical claim does not ship until the evidence tag and the Dayanak line are filled, and not until the person responsible for the destination has accepted them. The builder can check that the fields are present. It cannot check that they are true. That is an editorial step in front of step 2, and the pipeline does not bypass it.
+A missing photograph inside a verified pack is a flat frame and the title. A missing audio file disables Dinle and leaves the labels usable. A checksum mismatch is not a partial walk: the version is not marked ready, and the visitor is offered a retry of the same object.
 
-## 9. Observability
+## 13. Observability
 
-We alarm on:
+Alarms, all in CloudWatch:
 
-- MediaConvert job error
-- Builder error, or a build row older than the job's own timeout with no checksum
-- Catalog 5xx
-- A rise in signature failures, which usually means a client bug or someone replaying expired URLs
-- Origin 4xx on a version the catalog is currently issuing
+- MediaConvert job error, via the state machine
+- `PublishPack` execution failed or timed out
+- API Gateway 5xx
+- A rise in signature failures on the download route
+- CloudFront origin 4xx or 5xx for a version the catalog is currently issuing
 
-We do not alarm on "no playback heartbeats." Silence from the field is the product working. A dashboard of concurrent listeners would require the phone to phone home from the site. We will not add that beacon in order to have a chart.
+X-Ray is on the HTTP API and the state machine. It is not on the phone during field mode.
 
-The metric that matters for capacity is pack bytes transferred, by destination and version, and transcode minutes per publish. Those two numbers are how this system grows.
+We do not alarm on "no playback heartbeats." Silence from the field is the product working. A chart of concurrent listeners would require the phone to call home from the site. That beacon is not part of this architecture.
 
-## 10. Failure, from the visitor's side
+The two numbers that matter for capacity are pack bytes transferred, by destination and version, and MediaConvert minutes per publish.
 
-| What broke | What the visitor sees | What the system does |
+## 14. Failure, as the visitor sees it
+
+| What broke | What the visitor sees | What AWS did |
 | --- | --- | --- |
-| Hotel wifi drops mid-download | Progress pauses, then continues | Range request, same version |
-| Checksum fails | «Paket doğrulanamadı» and a retry | Version is not ready. Pointer unchanged. |
-| Catalog unreachable, pack ready | The walk is unaffected | Client does not ask |
-| Catalog unreachable, nothing downloaded | The last catalog, or an empty state | No synthetic destinations |
-| Publish of version 4 fails | Nothing. They still have 3 or they download 3 | Pointer stays on 3 |
-| Photograph missing inside a good checksum | Flat frame, title still there | Client-side fallback. Should be rare, because the checksum listed the file. |
+| The network drops mid-download | Progress pauses, then continues | CloudFront range, same version prefix |
+| Checksum fails | «Paket doğrulanamadı» and a retry | Pointer unchanged. Version not ready. |
+| Catalog unreachable, pack ready | The walk is unaffected | The phone does not ask |
+| Catalog unreachable, nothing downloaded | The last catalog response, or an empty state | No synthetic destinations |
+| `PublishPack` fails | Nothing. They still have the previous version, or they download it | SNS to the editor. `currentVersion` stays. |
+| Photograph missing inside a good checksum | Flat frame, title still there | Should be rare: the checksum listed the file |
 
-## 11. Phases
+## 15. Phases
 
-**Phase 0, now.** Design system and this architecture. Editorial work happens offline, outside the public repository. No production bucket is implied by the existence of this document.
+**Phase 1.** The four stacks in `eu-central-1`. One or two destinations. Done means a verified pack and a full walk with the radio off. No visitor URL exists before the first Commit state succeeds.
 
-**Phase 1.** Private masters bucket, pack bucket, CloudFront, MediaConvert, the builder, a catalog with one or two destinations, the client states in section 4. Done means: radio off, a verified pack, a full walk.
+**Phase 2.** Cognito in the path of paid destinations, entitlement webhook, restore on a second device, preview objects. SES only if Cognito mail is no longer enough.
 
-**Phase 2.** Cognito, entitlements, restore on a second device, preview objects. Payment stays behind the provider's confirmation to our API.
+**Phase 3.** The same pack as a teaching unit: a class or a guide reopens stops, labels, and evidence tags. If AWS needs anything new, it is a flag on `destinations`, not a parallel pipeline.
 
-**Phase 3.** The same pack used as a teaching unit: a class or a guide reopens stops, labels, and evidence tags without a second content model. If this needs anything new on AWS, it is a flag on the destination, not a parallel pipeline.
+A phase does not add a service that its own paragraph does not name.
 
-A phase does not start by adding a service from the table that its own paragraph does not mention.
-
-## 12. Explicit non-goals
+## 16. Non-goals
 
 - Streaming the narration from the site. The file is local.
-- Live GPS triggers, geofenced autoplay, and any background location that exists to start audio.
-- Realtime sync of playback position.
+- Live GPS triggers, geofenced autoplay, and Amazon Location Service as a way to start audio.
 - A visitor-uploaded route.
 - Transcoding on the phone.
 - A public S3 website, an open bucket, or a pack URL that does not expire.
-- Reusing any other product's account system, content database, or client. Odyssey has its own packs and its own catalog.
+- A second cloud, a Kubernetes cluster, or a long-running encoder.
+- Reusing another product's account system or content database. Odyssey has its own Cognito pool, its own tables, and its own buckets.
 
-## 13. Repository boundary
+## 17. Repository boundary
 
-This repository holds the design system and the architecture. Implementation lands here as it becomes real: the client, the builder, and the catalog, in that order of usefulness to a visitor. Infrastructure definitions land beside the code they describe, with no embedded secrets. Sample manifests in tests use the shape in section 3 and fictional content.
+This repository holds the design system and this architecture. The CDK stacks, the Lambda handlers, and the client land here as they become real, in that order of usefulness to a visitor. Stack definitions contain no secrets.
 
-Narration scripts, research notes, and photography do not get added "so the repository looks fuller." They are the product's unpublished material, and they do not belong in a public archive.
+Sample manifests in tests use the shape in section 5 and fictional content. Narration scripts, research notes, and photography do not get added so the repository looks fuller. They stay in the masters bucket, which is not public.
